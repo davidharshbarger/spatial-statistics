@@ -1,0 +1,820 @@
+---
+title: "STAT 141 | Vignette 1 | Point Process Modelling"
+author: "David Harshbarger"
+date: "January 2023"
+output:
+  html_document:
+    df_print: paged
+subtitle: Estimating intensity of Euclayptus sparsifolia in New South Wales
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sf)
+library(spatstat)
+library(mapview)
+```
+
+# Background
+
+This vignette will illustrate the use of `spatstat`, `sf`, and the theory we have learned in lectures to analyze a point process using real-world data, from start to finish. We seek to illustrate the combination of R's associated spatial statistical capabilities within our suggested workflow, and provide a worked example in which we tackle many of the thorny issues that inevitably arise in the research process. By the end, you'll have been exposed to each step of the spatial data analysis process, 
+
+This vignette uses data from the analysis set forth in [Point process models for presence-only analysis](https://besjournals.onlinelibrary.wiley.com/doi/full/10.1111/2041-210X.12352) by Renner et al (2015). From the paper: "The data set comprises 230 presence-only locations of *Eucalyptus sparsifolia* within the Greater Blue Mountains World Heritage Area (GBMWHA) and a surrounding 100-km buffer zone, an 86,227-km area near Sydney, Australia". The data are sourced from the New South Wales Office of Environment and Heritage.
+
+# Goal
+
+This analysis will be motivated by both inference and prediction (as well as general exploration of our data). Imagine that perhaps you are a researcher of Eucalyptus trees, with several possible areas in which to conduct a new study, but with limited resources. You can only pick one area for your study, and you don't know whether or not you will even have any Eucalyptus to study until you get there! Using the data available to us, we will do our best to estimate the intensity of Eucalyptus tree locations as a function of the available covariates, and we will then use the covariate data available to us to make our predictions.
+
+# R prerequisites
+
+The necessary familiarity with R programming required to interact with all parts of this vignette is described as follows:
+
+* `spatstat`: EDA and modelling of spatial point processes such as the one presented in this vignette are done using this package, but what is really helpful background knowledge here is
+    * **Fitting linear models:** much of the model-fitting in `spatstat` is designed to remind the user of the typical syntax and workflow of model-fitting (particularly linear models with `lm()`, `glm()`, and others). Any prior experience with these tasks will be directly beneficial in conducting experiments and collecting results with spatial data.
+* `tidyverse`: For data wrangling and general workflow in R, we use `tidyverse` packages and syntax heavily. It is helpful to be comfortable with the "pipe" operator (%>%). When using certain functions from `tidyverse` packages for the first time, you may notice that the package is explicitly referenced using the double-colon operator, such as `dplyr::select(...)`. This is not strictly necessary once the packages have been loaded and is simply done for the reader's reference.
+* `sf`: Reading, storing, and manipulating spatial data is done with `sf`, which implements the "Simple Features" standard for vector data in R.
+
+# Import and visualize data
+
+We will use two main datasets as the basis of our analysis - one for the target variable, *Eucalyptus sparsifolia* and its locations, and one for our covariates.
+
+From the associated README file:
+
+The covariates `.RData` file contains a data frame `covariates` with the following environmental variables 
+for locations within the Greater Blue Mountains World Heritage Area:
+
+**`X`**: the longitude in UTM (reference longitude 153) \
+**`Y`**: the latitude in UTM (reference longitude 153) \
+**`FC`**: the number of fires since 1943 \
+**`D.Main`**: distance to the nearest main road, in kilometres \
+**`D.Urb`**: distance to the nearest urban area, in kilometres \
+**`Rain`**: annual rainfall, in metres \
+**`MXT`**: annual maximum temperature, in degrees Celsius \
+**`MNT`**: annual minimum temperature, in degrees Celsius \
+**`soil`**: a categorical soil covariate, with the following categories:
+
+* 0: NA
+* 2: siliceous (white) sandplains
+* 5: low quartz sedimentary, ultramafic igneous and metamorphics, aeolian (red) sandplains, or limestone
+* 6: felsic intrusives
+    * 7: high quartz sedimentary
+  	* 8: mafic volcanics and intrusives
+  	* 11: floodplain alluvium, lacustrine sediments, or estuarine sediments
+  	* 12: residual alluvial sands or residual alluvial/colluvial sand and gravel
+  	* 15: felsic volcanics
+
+## Target variable - *Eucalyptus sparsifolia*
+
+Our target variable is stored as a text file (tab-separated values, or `.tsv`), which is common for large data sets. Visual inspection of the file shows that there are several rows of headers before tabular data begins, so we will skip them upon import:
+
+```{r}
+eucalyptus <- read_tsv("data/eucalyptus.txt", skip = 4,
+                       col_names = T)
+# summary(eucalyptus)
+```
+
+From the summary, we see that many columns are uninformative, so we will remove them. Ultimately, most of the columns in this dataset will not be of use to us except for the point locations of our target variable, but it is good to keep these features while we can, as they may be useful later on for sanity checks, summary statistics, visualization, or communication of results.
+
+We will also trim our observations somewhat - many observations have an associated measure of accuracy of location which is unsuitable for point process modelling. We will consider accuracy <= 10 (meters) to be an indication of high precision, and to be represented as points in the window. Observations with greater or missing accuracies will be removed.
+
+*Note: how you perform data pre-processing is up to you, and is a design choice! Feel free to play around with the eucalyptus dataset and make different decisions, and see how that affects the analysis.*
+
+```{r filter-eucalyptus, eval=TRUE}
+eucalyptus <- eucalyptus %>% 
+  select(SightingKey, LocationKey, DatasetName, DateFirst, DateLast,
+         NumberIndividuals, SourceCode, ObservationType, Description,
+         Longitude_GDA94, Latitude_GDA94, Easting, Northing, Accuracy,
+         SightingNotes, LocationNotes) %>%
+  # dates usually require some cleanup
+  mutate(DateFirst = gsub("/", "-", DateFirst, fixed=TRUE),
+         DateLast = gsub("/", "-", DateLast, fixed=TRUE)) %>% 
+  # the `lubridate` package is handy for dates
+  mutate(DateFirst = lubridate::dmy(DateFirst),
+         DateLast = lubridate::dmy(DateLast)) %>% 
+  filter(Accuracy < 10)
+# 200 eucalyptus observations remain
+```
+
+```{r}
+# View(head(eucalyptus))
+```
+
+In keeping with best practices for point data in R, we will now convert `eucalyptus` to an `sf` object, and eventually to `ppp`. When we make this conversion, we must specify the columns to be used as coordinate data. What about a coordinate reference system?
+
+```{r}
+eucalyptus_sf <- st_as_sf(eucalyptus,
+                          coords = c("Longitude_GDA94", "Latitude_GDA94"))
+st_crs(eucalyptus_sf)
+```
+
+There is no crs yet as we have not set one. But implicitly there is a correct crs to choose, and we have a hint in the column names. Based on the names `Longitude_GDA94` and `Latitude_GDA94`, a quick Google search for "GDA94 EPSG" returns an EPSG code of 4283. [https://epsg.io/4283](https://epsg.io/4283).
+
+This is a good start, but remember that simply having a crs in place is not sufficient to apply the thoery of spatial statistics we have been learning using `spatstat`, which implies that points lie in Euclidean space (a flat plane). Because our location data refer to lon/lat coordinates on the **curved surface of the globe**, we need an additional transformation to project our data. It is best to use the same projection for all data sources in an analysis, so we will pause our setup of the target variable at this stage to bring in the covariate data, before determining the best projection for both.
+
+## Covariates
+
+We will load the `.RData` file which contains a dataframe of values of covariates associated with each pixel in the window. This is an example of raster data, which is the data format required for covariates in a spatial model. However, the types of public data sources which are widely available and upon which you will rely for spatial data analysis are commonly found as point data. High-resolution raster data is usually only available via satellite imagery / remote sensing, and so in practice is often obtained by interpolating between observed points in a random field. Module 3 of STAT 141 deals with Geostatistics (the practice of computing these values in a principled manner). In this vignette, we will import our covariate data directly in its raster form (though still requiring some manipulation to use!). We will return to geostatistics in a later vignette.
+
+```{r load-data}
+load("data/covariates.RData")
+class(covariates)
+dim(covariates)
+```
+
+With `r nrow(covariates)` observations, we would easily overwhelm an interactive viewer such as `mapview`. But we still need to visualize this object.
+
+First, we need to specify a coordinate reference system - the documentation says UTM for Universal Transverse Mercator, a type of planar projection. A version of the UTM projection, centered on the eastern Australia timezone, is given by [EPSG code 32755](https://epsg.io/32755). We will try that:
+
+```{r covariates_sf}
+a <- Sys.time() # just a timer to benchmark computation speed
+covariates_sf <- covariates %>% 
+  st_as_sf(coords = c("X", "Y")) %>% 
+  st_set_crs(value = 32756)
+# this will take a few seconds for a file of this size
+b <- Sys.time()
+b-a
+```
+
+Visualize a tiny sample, just to check distortion or translation of points:
+
+```{r base-plot}
+sample_for_plot = 0.0001 # plotting 1% of 1% of the points!
+covariates_sf %>% 
+  slice_sample(prop = sample_for_plot) %>% 
+  plot()
+```
+
+```{r mapview-plot, eval=FALSE}
+covariates_sf %>% 
+  slice_sample(prop = sample_for_plot) %>% 
+  mapview(zcol = "D.Urb")
+```
+
+So our crs is mis-specified. Inspect the first few rows:
+
+```{r}
+head(covariates_sf)
+```
+
+The units of the coordinates are pretty weird, what are their ranges?
+
+```{r}
+summary(covariates$X)
+summary(covariates$Y)
+```
+
+These don't seem like units on the order of meters, as they would all be right on top of each other. This seems more like miles or kilometers. What units are we using in our current coordinate reference system?
+
+```{r print-crs}
+st_crs(covariates_sf)
+```
+
+From the print-out of the crs info, we can dig around a bit and eventually read `LENGTHUNIT["metre",1]`, which indicates that our points of X and Y displacement are being interpreted as meters. Perhaps we can fix this issue with a simple multiplication, before we do the conversion to `sf`.
+
+```{r repair-crs}
+a <- Sys.time()
+covariates_sf <- covariates %>%
+  mutate(X_repaired = X * 1e3, # multiply X and Y by 1e3 = 1000
+         Y_repaired = Y * 1e3) %>% 
+  st_as_sf(coords = c("X_repaired", "Y_repaired")) %>% 
+  st_set_crs(value = 32756)
+b <- Sys.time()
+b-a
+```
+
+And now we view the result with `mapview` (for a reasonable sample size):
+
+```{r mapview-plot2, eval=FALSE}
+covariates_sf %>% 
+  slice_sample(prop = sample_for_plot) %>% 
+  mapview(zcol = "soil")
+```
+
+*   Remember that these points being visualized are not the *Eucalyptus sparsifolia* locations which are our target variable, but rather a random sample of points from a grid of covariate data. While point process models require gridded information like this, in practice it is more common to find covariate data in the form of separate points observed separately from the target variable (unless dealing with high-res satellite imagery, or other remote sensing contexts). Later on in this vignette, we'll show some basic methods in `spatstat` to convert point data for covariates into pixel images. And later on in STAT 141, we'll explore principled ways to do this, in *geostatistics*!
+
+Now since we're dealing with ecological data, it could be more useful to have a basemap of satellite imagery rather than streets and cities. Fortuitously, `mapview` makes this easy: simply hover over the layers icon and select `Esri.WorldImagery`. This dataset is usually kept within 3-5 years of currency, so our eucalyptus data from 2012 is actually a little bit out of date. But since we're just using this imagery for our own familiarity with the region, this is not a problem for us. Additionally, there are additional options for basemaps beyond these defaults. We can specify different default values with `mapviewOptions()`:
+
+```{r mapview-options}
+# here we set some helpful default basemaps for mapview. Since we're dealing with
+# ecological data, a satellite imagery basemap is more helpful than a street map
+# but NatGeoWorldMap is kind of a nice mix of both
+# mapview is built on Leaflet - see other options for Leaflet maps here!
+# https://leaflet-extras.github.io/leaflet-providers/preview/
+mapviewOptions(basemaps = c("Esri.WorldImagery",
+                            "Esri.NatGeoWorldMap",
+                            "NASAGIBS.ViirsEarthAtNight2012"))
+mapview(eucalyptus_sf)
+```
+
+## Matching CRS between data sources
+
+Having specified a crs from the nature of the covariates data, we can now match the eucalyptus data to the same crs:
+
+```{r match-crs}
+eucalyptus_sf <- eucalyptus %>%
+  st_as_sf(coords = c("Longitude_GDA94", "Latitude_GDA94")) %>% 
+  st_set_crs(value = 4283) %>% 
+  # then transform to match covariates data
+  st_transform(crs = st_crs(covariates_sf))
+
+identical(st_crs(eucalyptus_sf),
+          st_crs(covariates_sf)) # TRUE
+```
+Now, calling `mapview` on `eucalyptus_sf` will include a basemap, since it includes a crs.
+
+```{r}
+mapview(eucalyptus_sf)
+```
+
+# Prepare data for use with `spatstat`
+
+Now that our target and covariates data are properly projected, we need to prepare them for analysis in `spatstat`, as `ppp` objects. The first step is to determine an appropriate observation window and create it. The data source for our covariates gives us pixel data in a wider area than the area in which we observe our point process, so let's use the extent of that data source as the window.
+
+We can create a "convex hull" around our covariate data using the `sf` function `st_convex_hull()` in conjunction with `st_union()`. (Note: `st_union()` is required here as `st_convex_hull()` is applied element-wise... think about if we want a boundary *for each* point, or a boundary for *the union of every* point?)
+
+Let's test this approach:
+
+```{r hull-test}
+a <- Sys.time()
+hull_sf_test <- covariates_sf %>% 
+  # slice_sample(prop = 1e-2) %>% # we could downsample here, but don't need to
+  st_union() %>% # IMPORTANT
+  st_convex_hull()
+b <- Sys.time()
+b-a # ~30 seconds
+```
+
+Let's check the result:
+
+```{r}
+mapview(hull_sf_test)
+```
+
+What do we notice? The hull we've created crosses over a lot of ocean. It would be nice if we could "clip" the extent of this hull to the coastline, but we'd need to import a shapefile of coastline to do so, right? Well, typically yes. And it would be no problem - we could find a shapefile online from some official source (like the Australian government), download it, and import it as an `sf` polygon. However, some of the very common shapefiles (such as borders of countries) are available pre-loaded in certain R packages, as is the case here. The package `ozmaps` comes pre-loaded with an `sf` polygon, so we will use that. (Higher resolutions of coastlines are always possible, so if we needed much finer resolution we could try the official sources.)
+
+```{r, warning=FALSE}
+library(ozmaps) # typically, we want to load all required packages at the top
+# here we will simply be explicit about loading this package so that we know
+# where the ozmaps_states object is coming from
+```
+
+```{r}
+class(ozmaps::ozmap_states)
+mapview(ozmap_states) + mapview(hull_sf_test)
+```
+
+We can try to perform the intersection, but the default crs of the object from `ozmaps` doesn't happen to match what we're using. We can fix that on the fly:
+
+```{r bad-intersection, error=TRUE}
+st_intersection(hull_sf_test, ozmap_states)
+# but an error because st_crs(x) == st_crs(y) is not TRUE
+```
+
+```{r better-intersection}
+# intersect two shapes with the same crs
+(hull_sf_test2 <- st_intersection(hull_sf_test,
+                                 st_transform(ozmap_states,
+                                              crs = st_crs(hull_sf_test)))
+)
+```
+
+Now this works, but if we look at the output in the console we can see that it returned two polygons...
+what's going on there?
+
+
+```{r}
+mapview(hull_sf_test2)
+```
+
+If we zoom in to the south end of the polygon, we can see that there's an inlet which is causing problems. This is not an uncommon problem and it is easy to solve - since we only care about the geometry of the polygon, we need only perform a union of the polygons:
+
+```{r best-intersection}
+(hull_sf <- st_intersection(hull_sf_test,
+                st_transform(ozmap_states, crs = st_crs(hull_sf_test))) %>% 
+  st_union()
+)
+```
+
+```{r}
+mapview(hull_sf_test2)
+```
+
+## `sf` to `ppp`
+
+We are now ready to convert all these objects to `ppp` format, at which point we can begin to use the techniques from class. The first step is to define the observation Window, an object of class `owin`. Polygon objects are well-suited to this, which is why we've created this convex hull shape.
+
+```{r}
+hull_owin_unscaled <- as.owin(hull_sf)
+class(hull_owin_unscaled)
+plot(hull_owin_unscaled)
+```
+
+Convert `eucalyptus_sf` to `ppp` and set the observation window to match. We will also rescale the units from meters (commonly used for coordinate reference systems) to kilometers.
+
+```{r}
+eucalyptus_ppp_unscaled <- eucalyptus_sf %>% 
+  st_geometry() %>% # this step extracts the raw geometry, so we get an unmarked ppp
+  as.ppp()
+Window(eucalyptus_ppp_unscaled) <- hull_owin_unscaled
+
+# now rescale both points and hull window by a factor of 1000 (meters to km)
+eucalyptus_ppp <- rescale.ppp(eucalyptus_ppp_unscaled, s = 1e3)
+hull_owin <- rescale.owin(hull_owin_unscaled, s = 1e3)
+plot(eucalyptus_ppp)
+```
+
+We still need to format our covariates for richer analysis, but we can go ahead and begin with estimating the intensity of our target variable:
+
+```{r intens1}
+# Here we avoid naming the variable "intensity", because that is the name of 
+# a function in `spatstat`
+intens1 <- density.ppp(eucalyptus_ppp,
+                       sigma = bw.scott, # this is a judgment call
+                       edge = TRUE, # set TRUE to enable edge correction
+                       diggle = TRUE) # use the Diggle edge correction)
+plot(intens1)
+```
+
+As for the covariates, we will create a separate object for each covariate and store them together in a list, according to `spatstat` conventions. Named lists in which each element is a `ppp` or `im` object are very handy to use with this package, but that does mean that we will need to convert each relevant column in the covariates dataframe to a different object. As we will repeat this conversion, we define a function.
+
+This function will downsample our dataframe of covariate points, convert to `ppp` format, and then re-impute the pixels in-between the points to create the pixel image (or `im` object). *Why are we doing this, if we just downloaded that big file which was already raster data? First, it would just be nice for these computations to run quickly on everybody's computer who is following along in the live demo. Second, once we have downsampled the data we are now mimicing the common case in which we have point data available and must estimate the pixel image of the covariates, so this is an instructive example.*
+
+```{r def-covariates_to_im}
+# define a function which takes in a dataframe of covariates, the window, and
+# the name of the feature to be converted
+covariates_to_im <- function(cov_obj, window_obj, feature,
+                              seed = 141){
+  set.seed(seed) # since we are downsampling for computational efficiency
+  new_im <- cov_obj %>% 
+    select(X, Y, feature) %>% 
+    slice_sample(prop = 1e-3) %>% 
+    as.ppp(W = hull_owin)  %>% # converting to ppp, but we're not done yet:
+    ### IMPORTANT STEP
+    # impute the points object into an image (raster) over the window, using
+    # nearest neighbor(s) - here simply the nearest neighbor
+    nnmark(at = "pixels")
+  return(new_im)
+}
+```
+
+Above, we used the `nnmark()` function to interpolate pixel values based on the nearest neighbor. Another option would be to use kernel smoothing, perhaps a Gaussian kernel. You can implement this by changing `nnmark()` to `Smooth()`, which is also a `spatstat` function. What might be the tradeoffs here? Additionally, how might this interact with factor data as opposed to numeric data?
+
+```{r covariates_to_im}
+# create list of covariate names from our dataset, to iterate over
+# first two columns are X and Y, so skip them and start indexing from 3
+(covariate_names <- names(covariates)[3:length(names(covariates))])
+# first two columns are XY, skip them
+# c("FC", "D.Main", "D.Urb", "Rain", "MXT", "MNT", "soil")
+covariate_list <- vector(mode = "list", length = length(covariate_names))
+for (i in 1:length(covariate_names)){
+  covariate_list[[i]] <- covariates_to_im(cov_obj = covariates,
+                                          window_obj = hull_owin,
+                                          feature = covariate_names[[i]])
+}
+
+# alternate, slightly recommended syntax is to use lapply(). But == either way
+# covariate_list <- lapply(X = covariate_names, FUN = covariates_to_im,
+#                          cov_obj = covariates, window_obj = hull_owin)
+
+# add names to the list so that we can index them with the $ operator
+names(covariate_list) <- covariate_names
+```
+Let's take a look at them all side-by side:
+
+```{r plot-covariate-ims}
+par(mfrow = c(2, 4))
+plot(covariate_list$FC)
+plot(covariate_list$D.Main)
+plot(covariate_list$D.Urb)
+plot(covariate_list$Rain)
+plot(covariate_list$MXT)
+plot(covariate_list$MNT)
+plot(covariate_list$soil)
+```
+
+Do any of the plots surprise you? If you experimented with `Smooth()` instead of `nnmark()`, what did you notice?
+
+# EDA: Exploring Correlation with `spatstat`
+
+## The Inhomogenous K-function
+
+Recall the K-function, and its intuition as the "correlation function". Here we are testing correlation of eucalyptus trees with each other (a measure of clustering). We use `envelope()` to simulate many different realizations of point patterns with our estimated intensity, and we supply that intensity object which have saved as `intens1` to the `simulate =` argument.
+
+```{r k-function}
+a <- Sys.time()
+K_eucalyptus <- envelope(eucalyptus_ppp, #specify data
+                         fun = Kinhom, # specify method for envelopes
+                         sigma = bw.CvL, # a judgment call on which kernel
+                         funargs = list(method = "isotropic",
+                                        leaveoneout = TRUE), # args for Kinhom
+                         nsim = 99, # specify number of MonteCarlo sims.
+                         verbose = FALSE, # do not display simulations,
+                         simulate = expression(rpoispp(intens1))
+                         )
+b <- Sys.time()
+b-a
+```
+
+```{r plot-k-function}
+plot(K_eucalyptus)
+```
+
+There is some visual evidence of local clustering, and distant regularity. This makes sense with what we've seen from the density plot. Remember that the empirical K-function here tells us, for each $r$, the average number of neighbor trees lying $r$ meters of a typical tree, divided by the density in eucalyptus per unit area. Estimated values are expressed in units of (number)/(number/area) = area.
+
+Note also the argument `leaveoneout = TRUE` -- we are estimating a K-function for an IPP whose intensity we are also estimating from the same data, which means we could have very high bias. The "leave-one-out" estimator attempts to somewhat reduce this bias.
+
+Now for the pairwise correlation function:
+
+```{r pcf}
+a <- Sys.time()
+pcf_eucalyptus <- envelope(eucalyptus_ppp, #specify data
+                           fun = pcfinhom, # specify method for envelopes
+                           sigma = bw.scott,
+                           funargs = list(method = "isotropic",
+                                          leaveoneout = TRUE), # args for pcfinhom
+                           nsim = 99, # specify number of MonteCarlo sims.
+                           verbose = FALSE, #do not display simulations,
+                           simulation = expression(rpoispp(intens1))
+                           )
+b <- Sys.time()
+b-a
+```
+
+```{r K-pcf-plots}
+par(mfrow = c(1,2), mar = rep(2,4))
+plot(K_eucalyptus, main = "Inhomogeneous K function")
+plot(pcf_eucalyptus, main = "Inhomogeneous PCF function")
+```
+(Theoretical Poisson process is "catching up" in the PCF around r=10)
+
+The K-function and pairwise correlation function are very similar and are mathematically related - why do we need both? Why use K at all when PCF is arguably more interpretable? The answer is that the K-function seems to perform better in hypothesis testing (see Baddeley text).
+
+What other assumptions are we bringing while using the inhomogeneous K-function to analyze correlation? If we were using the K-function, the assumption would be that the process is stationary (HPP). But with `Kinhom()`, the critical assumption is that the process is *correlation stationary*. That is, if we partition the window we can get similar estimates of the inhomogeneous K-function in different quadrats. But we are going to go further, and try to model the intensity as a function of our covariates.
+
+(Note that these envelope plots would take a while longer to generate envelopes for by simulation if we had many many points.)
+
+Recall also that we learned about the F and G functions, whose intuition is the "empty-space function" and the "nearest-neighbor function", respectively. Comparison to the respective functions under complete spatial randomness are dotted in red.
+
+```{r F-and-G-functions}
+a <- Sys.time()
+F_eucalyptus <- envelope(eucalyptus_ppp, # specify data
+                   fun = Finhom, # specify method for envelopes
+                   funargs = list(sigma = bw.CvL(eucalyptus_ppp)),
+                   nsim = 99, # specify number of MonteCarlo sims.
+                   verbose = FALSE, # do not display simulations
+                   simulation = expression(rpoispp(intens1))
+                   )
+b <- Sys.time()
+b-a
+
+a <- Sys.time()
+G_eucalyptus <- envelope(eucalyptus_ppp, 
+                   fun = Ginhom, 
+                   funargs = list(sigma = bw.CvL(eucalyptus_ppp)),
+                   nsim = 99, 
+                   verbose = FALSE,
+                   simulation = expression(rpoispp(intens1))
+                   )
+b <- Sys.time()
+b-a
+```
+
+```{r}
+par(mfrow = c(1,2), mar = rep(2,4))
+plot(F_eucalyptus, main = "Inhomogeneous F function\n(empty space)")
+plot(G_eucalyptus, main = "Inhomogeneous G function\n(nearest neighbor)")
+```
+
+We are nearly ready to begin modelling our point data as the realization of an Inhomogeneous Poisson Process with a non-constant intensity as some function of our covariates.
+
+# Modelling and Inference
+
+Remember our goal: given two regions in the window of equal area, we want to be able to determine the relative probability of observing 1 or more new eucalyptus.
+
+## Covariate relation to target
+
+First, it would be good to know how each of our covariates correlates with our target variable. Visually, we can start to get a sense:
+
+```{r}
+plot_covariate_and_eucalyptus <- function(ppp, covariate_name){
+  covariate_index <- which(covariate_names == covariate_name)
+  plot(covariate_list[[covariate_index]], main = covariate_name)
+  points(ppp, col = "white")
+}
+
+par(mfrow = c(2, 4))
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "FC")
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "D.Main")
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "D.Urb")
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "Rain")
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "MXT")
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "MNT")
+plot_covariate_and_eucalyptus(ppp = eucalyptus_ppp, covariate_name = "soil")
+```
+
+We can perform a more statistical test of covariate dependence by employing the Kolmogorov-Smirnov CDF test, as we are doing on HW 3 right now. The K-S test is a test of the similarity of two distributions, and what we're doing is testing the distributions of two subsets of the covariate data: one where our target variable's points are located, and the other simply everywhere else. Under complete spatial randomness, we would expect the distributions to be completely independent (and therefore similar) if the covariate and the target are completely independent. The need to evaluate the covariates at points at which our data are *not* located is why we went to the trouble of creating image objects for our covariates. K-S tests for each covariate are below.
+
+```{r cdf, error=TRUE}
+cdf_list <- vector(mode = "list", length = length(covariate_list))
+names(cdf_list) <- covariate_names
+
+cdf_list$FC <- cdf.test(eucalyptus_ppp,     covariate_list$FC, test = "ks")
+cdf_list$D.Main <- cdf.test(eucalyptus_ppp, covariate_list$D.Main, test = "ks")
+cdf_list$D.Urb <- cdf.test(eucalyptus_ppp,  covariate_list$D.Urb, test = "ks")
+cdf_list$Rain <- cdf.test(eucalyptus_ppp,   covariate_list$Rain, test = "ks")
+cdf_list$MXT <- cdf.test(eucalyptus_ppp,    covariate_list$MXT, test = "ks")
+cdf_list$MNT <- cdf.test(eucalyptus_ppp,    covariate_list$MNT, test = "ks")
+cdf_list$soil <- cdf.test(eucalyptus_ppp,   covariate_list$soil, test = "ks",
+                          jitter = FALSE,
+                          interpolate = FALSE) # don't interpolate factors
+```
+
+Printing the results of any of the objects in `cdf_list`, we see that the estimated p-values indicate that each feature is associated with the covariate. However, it doesn't tell us the strength of association.
+
+(Question: why didn't the cdf test work on the soil image?)
+
+Note, the CDF K-S test is not the only test we have available here. The Berman test is an alternative, and Foxall's J-test is appropriate if we are interested in computing distance between our points and another point pattern (or line segment pattern). This might come in handy if we needed to compute distance to main roads ourselves - one could find a shapefile of major roads from an official Australian government source, read it in using `sf` as a "LINESTRING" or "MULTILINESTRING", and then convert it to a spatstat-compatible class `psp` (line segment pattern).
+
+## Strength of covariate relationship to target
+
+So all of our covariates seem to be non-randomly connected to the target. But how strong is the association? One familiar tool which can be used is the Receiver Operating Characteristic (ROC) and the associated Area Under Curve metric (AUC). 
+
+```{r roc}
+roc_list <- vector(mode = "list", length = length(covariate_list))
+names(roc_list) <- covariate_names
+
+roc_list$FC <- roc(X = eucalyptus_ppp,     covariate = covariate_list$FC)
+roc_list$D.Main <- roc(X = eucalyptus_ppp, covariate = covariate_list$D.Main)
+roc_list$D.Urb <- roc(X = eucalyptus_ppp,  covariate = covariate_list$D.Urb)
+roc_list$Rain <- roc(X = eucalyptus_ppp,   covariate = covariate_list$Rain)
+roc_list$MXT <- roc(X = eucalyptus_ppp,    covariate = covariate_list$MXT)
+roc_list$MNT <- roc(X = eucalyptus_ppp,    covariate = covariate_list$MNT)
+# roc_list$soil <- roc(X = eucalyptus_ppp,   covariate = covariate_list$soil)
+```
+
+```{r auc}
+auc_list <- vector(mode = "list", length = length(covariate_list))
+names(auc_list) <- covariate_names
+
+auc_list$FC <- auc(X = eucalyptus_ppp,     covariate = covariate_list$FC)
+auc_list$D.Main <- auc(X = eucalyptus_ppp, covariate = covariate_list$D.Main)
+auc_list$D.Urb <- auc(X = eucalyptus_ppp,  covariate = covariate_list$D.Urb)
+auc_list$Rain <- auc(X = eucalyptus_ppp,   covariate = covariate_list$Rain)
+auc_list$MXT <- auc(X = eucalyptus_ppp,    covariate = covariate_list$MXT)
+auc_list$MNT <- auc(X = eucalyptus_ppp,    covariate = covariate_list$MNT)
+# auc_list$soil <- auc(X = eucalyptus_ppp,   covariate = covariate_list$soil)
+```
+
+```{r plot-roc}
+par(mfrow = c(2, 3))
+
+plot(roc_list$FC,     main = paste0("FC\nAUC: ",     round(auc_list$FC, 2)))
+plot(roc_list$D.Main, main = paste0("D.Main\nAUC: ", round(auc_list$D.Main, 2)))
+plot(roc_list$D.Urb,  main = paste0("D.Urb\nAUC: ",  round(auc_list$D.Urb, 2)))
+plot(roc_list$Rain,   main = paste0("Rain\nAUC: ",   round(auc_list$Rain, 2)))
+plot(roc_list$MXT,    main = paste0("MXT\nAUC: ",    round(auc_list$MXT, 2)))
+plot(roc_list$MNT,    main = paste0("MNT\nAUC: ",    round(auc_list$MNT, 2)))
+# plot(roc_list$soil,    main = paste0("soil plot\nAUC: ", round(auc_list$soil, 2)))
+```
+
+What's next? We still want to get to a point where we're modelling intensity as a combination of features, and not just individual features. We have a sense of which covariates are related, and the strength of their relationships - now let's try to get a sense of the "shape" of those relationships, so to speak. (Are they linear? Quadratic? Log-linear? etc)
+
+## Estimating rho-hat
+
+We can estimate the product density $\hat{\rho}$ across the range of values that each covariate takes on. In this way, we can gauge the story of the relationship between a covariate and the estimated intensity. The function `rhohat` handles this very nicely:
+
+```{r rhohat}
+rhohat_list <- vector(mode = "list", length = length(covariate_list))
+names(rhohat_list) <- covariate_names
+
+rhohat_list$FC <- rhohat(object = eucalyptus_ppp,
+                         covariate = covariate_list$FC,
+                         method = "ratio") # because of NaN values induced by count data
+rhohat_list$D.Main <- rhohat(object = eucalyptus_ppp,
+                             covariate = covariate_list$D.Main,
+                             method = "reweight")
+rhohat_list$D.Urb <- rhohat(object = eucalyptus_ppp,
+                            covariate = covariate_list$D.Urb,
+                            method = "reweight")
+rhohat_list$Rain <- rhohat(object = eucalyptus_ppp,
+                           covariate = covariate_list$Rain,
+                           method = "reweight")
+rhohat_list$MXT <- rhohat(object = eucalyptus_ppp,
+                          covariate = covariate_list$MXT,
+                          method = "reweight")
+rhohat_list$MNT <- rhohat(object = eucalyptus_ppp,
+                          covariate = covariate_list$MNT,
+                          method = "reweight")
+# rhohat_list$soil <- rhohat(object = eucalyptus_ppp,
+#                            covariate = covariate_list$soil,
+#                            method = "reweight")
+```
+
+```{r rhohat-plot}
+par(mfrow = c(2, 3))
+plot(rhohat_list$FC, main = "Rho-hat estimate using FC")
+plot(rhohat_list$D.Main,  main = "Rho-hat estimate using D.Main")
+plot(rhohat_list$D.Urb, main = "Rho-hat estimate using D.Urb")
+plot(rhohat_list$Rain, main = "Rho-hat estimate using Rain")
+plot(rhohat_list$MXT, main = "Rho-hat estimate using MXT")
+plot(rhohat_list$MNT, main = "Rho-hat estimate using MNT")
+# plot(rhohat_list$soil, main = "Rho-hat estimate using soil")
+```
+Look how spiky the `FC`-based estimate of $\hat{\rho}$ is. This is related to the fact that this covariate is simply a count of fires that have occurred at each location since the 1940s - it is count data. Does this estimation approach make sense?
+
+Remember that these are no longer distances being plotted on the x-axes, but rather ranges of values which that covariate takes on. This demonstrates the non-linear effects of certain covariate values on intensity. Since these estimates do not take into account interactions, they are assuming that the intensity $\rho$ depends *only* on that single covariate, which is probably not true. However, they still have useful interpretations as the estimate of average intensity $\lambda(u)$ at all locations $u$ in which the covariate $Z(u)$ takes on some value $z$, for values of $z$ on the horizontal axis.
+
+(Note: the fact that some of these are log-linear could tell us that there are multiplicative effects - think about expressing these through interactions. Also examine rho2hat for interactions between variables.)
+
+**Warning:** be careful not to read too much into the estimated intensities at levels of a variable where there are few or zero data points. The function still plots an estimate and a confidence interval, but this type of covariate shift can really harm our ability to make good assumptions during model selection.
+
+We can also try taking the log of some of the estimated intensities, to see what they look like under transformation. You can take this further as well.
+
+```{r log-rhohat-plot}
+par(mfrow = c(2, 3))
+plot(rhohat_list$FC,     log = "y", main = "Rho-hat estimate using FC")
+plot(rhohat_list$D.Main, log = "y", main = "Rho-hat estimate using D.Main")
+plot(rhohat_list$D.Urb,  log = "y", main = "Rho-hat estimate using D.Urb")
+plot(rhohat_list$Rain,   log = "y", main = "Rho-hat estimate using Rain")
+plot(rhohat_list$MXT,    log = "y", main = "Rho-hat estimate using MXT")
+plot(rhohat_list$MNT,    log = "y", main = "Rho-hat estimate using MNT")
+# plot(rhohat_list$soil, main = "Rho-hat estimate using soil")
+```
+
+We can then explore two-way interactions of covariates on estimated intensity with the function `rho2hat`. For instance, pairing minimum temperature and maximum temperature yields an interesting bimodal density that wasn't obvious before.
+
+```{r rho2hat}
+plot(rho2hat(object = eucalyptus_ppp,
+             cov1 = covariate_list$MNT,
+             cov2 = covariate_list$MXT,
+             method = "reweight"),
+     main = "Interaction of MNT/MXT on rho-hat")
+```
+
+But note that these plots can be tricky to eyeball sometimes, because they do depend on the level of smoothing applied in the Gaussian kernel. The default value is $1/8 = 0.125$, but other values are possible. For instance, $1/16$ gives:
+
+```{r rho2hat-sigma}
+plot(rho2hat(object = eucalyptus_ppp,
+             cov1 = covariate_list$MNT,
+             cov2 = covariate_list$MXT,
+             method = "reweight",
+             sigma = 1/16), # changing sigma from its default 1/8 to 1/16
+     main = "Interaction of MNT/MXT on rho-hat\n(sigma = 1/16)")
+```
+
+## Fitting a `ppm` model
+
+Let's take what we've learned and try to use it to build a model. We know that each of the covariates seems to be related to the target variable to at least some degree, we know that some of the effects may be multiplicative, and we know that some of the effects may be quadratic. What follows are many many options for how to potentially fit a point process model - experiment!
+
+```{r ppm-fit}
+
+# fitted models of single covariates
+fit_FC     <- ppm(eucalyptus_ppp ~ FC,     data = covariate_list)
+fit_D.Main <- ppm(eucalyptus_ppp ~ D.Main, data = covariate_list)
+fit_D.Urb  <- ppm(eucalyptus_ppp ~ D.Urb,  data = covariate_list)
+fit_Rain   <- ppm(eucalyptus_ppp ~ Rain,   data = covariate_list)
+fit_MXT    <- ppm(eucalyptus_ppp ~ MXT,    data = covariate_list)
+fit_MNT    <- ppm(eucalyptus_ppp ~ MNT,    data = covariate_list)
+fit_soil   <- ppm(eucalyptus_ppp ~ soil,   data = covariate_list)
+
+# fitted models with linear combinations of subsets of covariates
+fit1 <- ppm(eucalyptus_ppp ~ FC, data = covariate_list)
+fit2 <- ppm(eucalyptus_ppp ~ FC + D.Main, data = covariate_list)
+fit3 <- ppm(eucalyptus_ppp ~ FC + D.Main + Rain, data = covariate_list)
+
+fit4 <- ppm(eucalyptus_ppp ~ FC + soil, data = covariate_list)
+fit5 <- ppm(eucalyptus_ppp ~ FC + D.Main + soil, data = covariate_list)
+fit6 <- ppm(eucalyptus_ppp ~ FC + D.Main + Rain + soil, data = covariate_list)
+
+# fitted model of all covariates linearly combined
+fit_full_linear <- ppm(eucalyptus_ppp ~ FC + D.Main + D.Urb + MXT + MNT + Rain + soil,
+                       data = covariate_list)
+# fitted model of all covariates linearly combined, and all two-way interactions
+fit_full_interact <- ppm(eucalyptus_ppp ~ (FC + D.Main + D.Urb + MXT + MNT + Rain + soil)^2,
+                         data = covariate_list)
+
+# fitted models of polynomial terms, but with factor image of soil removed
+fit_poly <- ppm(eucalyptus_ppp ~ FC + D.Main + D.Urb + poly(MXT, MNT, Rain, degree = 2) + soil,
+                data = covariate_list)
+fit_poly2 <- ppm(eucalyptus_ppp ~ poly(FC, D.Main, D.Urb, MXT, MNT, Rain, degree = 2) + soil,
+                data = covariate_list)
+fit_poly3 <- ppm(eucalyptus_ppp ~ poly(FC, D.Main, D.Urb, MXT, MNT, Rain, degree = 3) + soil,
+                data = covariate_list)
+```
+
+We can compare models with the `anova()` command, or using the AIC criterion, just as we would with linear models or generalized linear models:
+
+```{r}
+# for example:
+anova(fit6, fit5, test = "Chi")
+AIC(fit6)
+AIC(fit5)
+```
+
+In the original paper (which albeit used slightly different eucalyptus data), this following model is the model which the authors specified, as the result of applying LASSO (L1) regularization to a full model of all 2nd-order interaction terms (`fit_full_interact`). While allowing you to make your own modelling choices, we will present some results with this selected model.
+
+```{r fit_paper}
+fit_paper <- ppm(eucalyptus_ppp ~ poly(FC, MXT, MNT, Rain, degree = 2) + D.Main + D.Urb + soil,
+                data = covariate_list)
+```
+
+To compare each covariate with this model, we can define nested models which drop out certain covariates:
+
+```{r}
+fit_paper_drop_FC <- ppm(eucalyptus_ppp ~ poly(MXT, MNT, Rain, degree = 2) + D.Main + D.Urb + soil,
+                data = covariate_list)
+fit_paper_drop_MXT <- ppm(eucalyptus_ppp ~ poly(FC, MNT, Rain, degree = 2) + D.Main + D.Urb + soil,
+                data = covariate_list)
+fit_paper_drop_MNT <- ppm(eucalyptus_ppp ~ poly(FC, MXT, Rain, degree = 2) + D.Main + D.Urb + soil,
+                data = covariate_list)
+fit_paper_drop_Rain <- ppm(eucalyptus_ppp ~ poly(FC, MXT, MNT, degree = 2) + D.Main + D.Urb + soil,
+                data = covariate_list)
+fit_paper_drop_D.Main <- ppm(eucalyptus_ppp ~ poly(FC, MXT, MNT, Rain, degree = 2) + D.Urb + soil,
+                data = covariate_list)
+fit_paper_drop_D.Urb <- ppm(eucalyptus_ppp ~ poly(FC, MXT, MNT, Rain, degree = 2) + D.Main + soil,
+                data = covariate_list)
+fit_paper_drop_soil <- ppm(eucalyptus_ppp ~ poly(MXT, MNT, Rain, degree = 2) + D.Main + D.Urb,
+                data = covariate_list)
+```
+
+and then apply `anova()`, with the argument `test = "LRT"`.
+
+```{r}
+anova_list <- vector(mode = "list", length = length(covariate_list))
+names(anova_list) <- covariate_names
+
+anova_list$FC <- anova(fit_paper, fit_paper_drop_FC, test = "LRT")$Deviance[2]
+anova_list$MXT <- anova(fit_paper, fit_paper_drop_MXT, test = "LRT")$Deviance[2]
+anova_list$MNT <- anova(fit_paper, fit_paper_drop_MNT, test = "LRT")$Deviance[2]
+anova_list$Rain <- anova(fit_paper, fit_paper_drop_Rain, test = "LRT")$Deviance[2]
+anova_list$D.Main <- anova(fit_paper, fit_paper_drop_D.Main, test = "LRT")$Deviance[2]
+anova_list$D.Urb <- anova(fit_paper, fit_paper_drop_D.Urb, test = "LRT")$Deviance[2]
+anova_list$soil <- anova(fit_paper, fit_paper_drop_soil, test = "LRT")$Deviance[2]
+
+sort(unlist(anova_list))
+```
+
+Another way to assess each covariate of a `ppm` is by examining partial residual plots with the `parres()` function. 
+
+```{r parres}
+par(mfrow = c(3, 2))
+plot(parres(fit_paper_drop_FC, covariate_list$FC))
+plot(parres(fit_paper_drop_D.Main, covariate_list$D.Main))
+plot(parres(fit_paper_drop_D.Urb, covariate_list$D.Urb))
+plot(parres(fit_paper_drop_Rain, covariate_list$Rain))
+plot(parres(fit_paper_drop_MXT, covariate_list$MXT))
+plot(parres(fit_paper_drop_MNT, covariate_list$MNT))
+# plot(parres(fit_paper_drop_soil, covariate_list$soil))
+```
+
+```{r model-summaries}
+# summary(fit_paper)
+```
+
+Finally, we can make use of the handy `diagnose.ppm()` function:
+
+```{r diagnose}
+diagnose.ppm(fit_paper)
+```
+
+# Prediction
+
+So how do we determine where spend our limited resources and choose a research station? Once we have a model we can accept, we can use `predict.ppm()` to generate a predicted number of points over any window. For instance, the predicted number of points which the model places over the whole observation window of this study is:
+
+```{r predict-hull}
+predict(object = fit_paper, window = hull_owin,
+        type = "count")
+```
+
+which is a slight underestimate of the observed number.
+
+We can define certain regions of interest as windows, and predict the expected number of points in them as well:
+
+```{r predict-regions}
+# These regions are designed by hand, using:
+# https://arthur-e.github.io/Wicket/sandbox-gmaps3.html
+wkt_1 <- c("POLYGON((150.47700701021927 -32.677884529585825,150.58137712740677 -32.677884529585825,150.58137712740677 -32.75645286291321,150.47700701021927 -32.75645286291321,150.47700701021927 -32.677884529585825))")
+wkt_2 <- c("POLYGON((150.62532243990677 -33.20802317247966,150.71321306490677 -33.20802317247966,150.71321306490677 -33.27693694952654,150.62532243990677 -33.27693694952654,150.62532243990677 -33.20802317247966))")
+
+wkt_1 <- wkt_1 %>%
+  st_as_sfc() %>%
+  st_set_crs(value = 4269) %>%
+  st_transform(crs = st_crs(eucalyptus_sf))
+wkt_2 <- wkt_2 %>%
+  st_as_sfc() %>%
+  st_set_crs(value = 4269) %>%
+  st_transform(crs = st_crs(eucalyptus_sf))
+
+wkt_1_owin <- rescale.owin(as.owin(wkt_1), s = 1e3)
+wkt_2_owin <- rescale.owin(as.owin(wkt_2), s = 1e3)
+
+predict(fit_paper, window = wkt_1_owin, type = "count")
+predict(fit_paper, window = wkt_2_owin, type = "count")
+```
+
+```{r}
+# toggle euclyptus on and off to locate the small regions
+mapview(eucalyptus_sf) + mapview(wkt_1) + mapview(wkt_2)
+```
+

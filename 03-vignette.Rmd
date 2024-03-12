@@ -1,0 +1,549 @@
+---
+title: 'Vignette #3 | STAT 141'
+subtitle: 'Interpolation of a random field via kriging | Boston air quality case study'
+author: "David Harshbarger"
+date: "April 2023"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gstat)
+library(sf)
+library(mapview)
+require(leafsync)
+```
+
+> *Everything is related to everything else. But near things are more related than distant things.*
+  - *Waldo Tobler, 1969 (Tobler's First Law of Geography)*
+
+# Part 1: Setup
+
+In this third vignette, we'll practice applying the concepts we've learned in the Geostatistics module to some real-world spatial data regarding air quality in the Boston area. We'll use 56 simultaneous observations from around the city to interpolate values everywhere else across the city, and importantly, we'll quantify our uncertainty with the final result.
+
+The data for this vignette come from [PurpleAir](https://www2.purpleair.com/), a company which describes itself as follows:
+
+> *PurpleAir makes sensors that empower Community Scientists who collect hyper-local air quality data and share it with the public.*
+
+Here "Community Scientists" refers to anyone who is interested in contributing data to open source projects which might need accurate, real-time information, such as ours today. Because the locations of our observations are based on people or organizations opting in, we might ask ourselves whether there could be any interesting or potentially confounding trends in our observations to be aware of (more on that later).
+
+Either way, Boston has a number of these air quality sensors located around the region, which are continually collecting live data on air quality and presence of particulate matter, as well as a number of other potentially interesting covariates such as temperature and humidity (more on those later). You can view the data at their website, where they have a [continually updating interactive map](https://map.purpleair.com/1/m/lb/mAQI/a0/p604800/cC0#9.87/42.3232/-71.0536) showing the current and recent readings for each sensor.
+
+## About the data
+
+In addition to being easy to view, these data are available programatically via the PurpleAir API, which has documentation online and can be implemented in R. We've already done this step for you, and the data are available in the file `"03-vignette-data-01.RData"`. This API pull was done last Wednesday, on April 12, 2023. The data are formatted as two distinct `sf` points objects, one a subset of the other (for clairty while we work with simpler models) with the following features (from the [PurpleAir API documentation](api.purpleair.com)):
+
+* **`time_stamp`**: The servers [Unix time stamp](https://www.unixtimestamp.com/) from when the response was generated.
+  + The `time_stamp` values are within seconds of each other, as the data were pulled simultaneously. We don't need them here, but in the case that we were interested in modeling spatiotemporal dependence in addition to spatial dependence, we might make use of temporal data. It's an interesting (and tricky) project, but outside the scope of this vignette.
+* **`sensor_index`**: A unique identifier of each sensor, and therefore each observation in our data.
+* **`name`**: The name given to each sensor. It may seem like we don't need this if we have a uniquely identifying code like `sensor_index`. Can you think of a reason why there might be useful information here?
+* **`location_type`**: A binary variable indicating whether or not the sensor is indoors (1) or outdoors (0)
+* **`position rating`**: A rating of how certain we can be in the coordinates of the sensor, from no certainty (0) to highest precision (5)
+* **`pm2.5_24hour`**: **Our target variable.** Measures concentration of particulate matter with a diameter of fewer than 2.5 microns, averaged over the previous 24-hour period.
+* **`geometry`**: `sf` object column storing spatial points data for each observation
+
+The previous features are common to both data files, `bostonair_sf` and `bostonair_extended_sf`. The following features are unique to `bostonair_extended_sf`:
+
+* **`pm2.5`**: The recorded PM2.5 concentration at the point in time the data were collected. Unlike `pm2.5_24hour`, this is not an averaged measure. Air quality is known to be highly cyclical throughout the day, so there may be wide variation from the mean. This is a potential alternate target variable.
+* **`pm2.5_alt`**: Like `pm2.5`, a recorded concentration at the time the data were collected. This feature is simply an alternate calculation of the concentration called ALT-CF3, which claims to be more accurate. [Discussion here](https://community.purpleair.com/t/calibration-of-purpleair-monitors/482). This is a potential alternate target variable.
+* **`dist_to_hwy`**: Distance in feet from observation to the nearest major highway or interstate. (Note: this variable didn't come from the PurpleAir API - it was calculated using `sf::st_distance()` from a [government shapefile](https://catalog.data.gov/dataset/tiger-line-shapefile-2019-state-massachusetts-primary-and-secondary-roads-state-based-shapefile) of Massachusetts roads, using crs 2249)
+* **`altitude`**: The altitude for the sensor's location in feet.
+* **`temperature`**: Temperature inside of the sensor housing (F). On average, this is 8F higher than ambient conditions.
+* **`humidity`**: Relative humidity inside of the sensor housing (%). On average, this is 4% lower than ambient conditions.
+* **`pressure`**: Current pressure in Millibars.
+* **`deciviews`**: A [haze index](http://vista.cira.colostate.edu/Improve/visibility-basics) related to light scattering and extinction that is approximately linearly related to human perception of the haze.
+* **`visual_range`**: The distance from the observer that a large dark object, e.g. a mountain top or large building, just disappears from view.
+* **`voc`**: Volatile organic compounds (Voc) concentration. Most relevant for indoor sensors.
+
+# Part 2: Exploring covariate relationships in our data
+
+Before we can begin to model the random field which generated our observations, we need to do some exploration to become more acquainted with the correlation structure of our data. As we proceed, keep in mind any questions you have about potential trends and confounding variables. At this step, knowing only the descriptions of the features and not the data within them, which potential confounders may already grab our attention?
+
+Potential answers:
+
+* We have a binary indicator in `location_type` which determines whether or not the sensor is indoors or outdoors, which could influence our analysis quite a lot. How should we deal with this?
+* We have an ordered categorical indicator in `position rating` which gives a sense of the accuracy of the coordinates of the observation. Since we have no measure of the uncertainty, we'll simply filter out all observations with a less-than-perfect position rating.
+* We have a character variable `name` which might tell us something about particular sensors.
+
+```{r load-data}
+load("./data/03-vignette-data-04.RData")
+
+# filter data for outdoor sensors with trustworthy locations
+bostonair_sf <- bostonair_sf %>% 
+  filter(location_type == 0 & position_rating == 5)
+bostonair_extended_sf <- bostonair_extended_sf %>% 
+  filter(location_type == 0 & position_rating == 5)
+
+# check dimensions, they should each have 55 observations
+nrow(bostonair_sf); nrow(bostonair_extended_sf)
+```
+
+## Summarizing the target variable
+
+Our target variable is `pm2.5_24hour`, whose values are summarized below:
+
+```{r}
+summary(bostonair_sf$pm2.5_24hour)
+hist(bostonair_sf$pm2.5_24hour)
+qqnorm(bostonair_sf$pm2.5_24hour)
+qqline(bostonair_sf$pm2.5_24hour)
+```
+
+This does not really look normally distributed.
+
+**What does it mean for us that the target variable is not normally distributed? Kriging is a type of Gaussian Process regression after all... how big of a deal is this?**
+
+## Mapping the target variable
+
+Now let's inspect the spatial layout of our observations visually with `mapview`, and let's color the points by the target variable `pm2.5_24hour`:
+
+```{r map01}
+mapview(bostonair_extended_sf, zcol = "pm2.5_24hour")
+```
+
+The observations are spread around the Greater Boston area, extending out to around the range of Interstate-95. A reasonable question at this point might be: *If my observations were a random sample of the field, is it likely that they would look like this?*
+
+The intuitive answer is no. If we wanted to recall the first module of this class and connect to point patterns, we could compute the K-function or perform a quadrat test for complete spatial randomness. But more simply, we can just reason from what we know about the data. We know that PurpleAir prioritizes "citizen scientists", so we should expect clustering in locations where people are located (cities and suburbs). Interestingly, it also looks like the map is showing us that sensors are located along major arterial highways radiating out from the city into the surrounding region (if this is difficult to see, try changing the basemap in the plot window to `OpenStreetMap`). Now remember that stationarity and isotropy are assumptions about the underlying field we want to model, not about the locations of observations. However, the reason it may be important here is because certain sensors may be specifically located in areas of high or low air quality, which is a big hint that we may have some non-stationarity and anisotropy in our random field, and that we'll need to do some testing.
+
+## Class structure of observations
+
+While we hinted at it previously, now we'll explore the `name` feature, and learn something interesting about the data. Let's sort the observations in descending order of the target variable, and print their names:
+
+```{r}
+bostonair_sf %>% 
+  select(name, pm2.5_24hour) %>% st_drop_geometry() %>% 
+  arrange(desc(pm2.5_24hour))
+```
+
+These names are interesting, and they're kind of all over the place. Some seem completely unrelated, but others seem to have similar naming conventions. There seem to be at least two groups of sensors which could be operated by the same group, since we can see that their names include similar acronyms like "DEP" and "FRRACS". Let's add an indicator column called `name_class` by which we can group observations into "DEP", "FRRACS", or "OTHER".
+
+```{r}
+classify_names <- function(df){
+  df_new <- df %>% 
+    mutate(name_class = case_when(
+      grepl(pattern = "^DEP", x = name) ~ "DEP",
+      grepl(pattern = "FRRACS", x = name) ~ "FRRACS",
+      TRUE ~ "OTHER"))
+  return(df_new)
+}
+
+bostonair_sf <- classify_names(bostonair_sf)
+bostonair_extended_sf <- classify_names(bostonair_extended_sf)
+
+# check class sizes
+table(bostonair_extended_sf$name_class)
+
+# compare distributions of pm2.5 readings by classes with a box-and-whisker plot
+bostonair_sf %>% 
+  select(name, pm2.5_24hour, name_class) %>% st_drop_geometry() %>% 
+  arrange(desc(pm2.5_24hour)) %>% 
+  ggplot() +
+  geom_boxplot(aes(name_class, pm2.5_24hour)) +
+  labs(title = "Boxplot of distribution of pm2.5 by class of sensor")
+```
+
+Whatever DEP and FRRACS indicate, it seems they might be targeted specifically at making measurements in places with higher pm2.5 concentration than otherwise. Let's map it:
+
+```{r map-DEP-FRRACS}
+mapview(bostonair_extended_sf, zcol = "name_class")
+```
+
+We certainly have some clustering by class. If we do a quick Google search for "DEP Boston" and "FRRACS Boston", we learn that these sensors are likely operated by the Massachusetts Department of Environmental Protection, and also the community activism group "Fore River Residents Against the Compressor Station". Several of the DEP sensors seem to be located very near a main highway (the US-1 through Chelsea) and the FRRACS sensors are located around a recently constructed fracking plant (natural gas extraction). **So not only are the pm2.5 data not distributed according to a normal distribution, but they are not distributed according to any single distribution but rather a mixture of distributions.** Now we have an interesting modeling decision to make: how do we deal with this mixture distribution? We've emphasized throughout the course how spatial dependence requires us to relax the assumption of independent observations, but now we are relaxing the assumption of identically distributed assumptions as well.
+
+## Correlation of features with target variable
+
+A last preliminary step is to see which of the numeric features, if any, correlate with our target variable. The following code can help us visualize this:
+
+```{r plot_covariates_simply}
+plot_covariates_simply <- function(var_x, var_y = pm2.5_24hour,
+                                   log_x = FALSE) {
+  ggplot(data = bostonair_extended_sf,
+         aes(x = {{var_x}},
+             y = {{var_y}})) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "lm", se = F)
+  }
+```
+
+```{r, fig.show="hold", out.width="50%", warning=FALSE, message=FALSE}
+par(mfrow = c(2, 2))
+plot_covariates_simply(var_x = temperature)
+plot_covariates_simply(var_x = humidity)
+plot_covariates_simply(var_x = altitude)
+plot_covariates_simply(var_x = dist_to_hwy)
+```
+
+It looks like temperature and humidity are correlated with our target variable, along with altitude and distance to the nearest highway.
+
+```{r map03, fig.show="hold", out.width="45%"}
+leafsync::sync(mapview(bostonair_extended_sf,
+                       zcol = "temperature", layer.name = "temperature"),
+               mapview(bostonair_extended_sf,
+                       zcol = "humidity", layer.name = "humidity"))
+```
+
+There is a pretty clear spatial trend with each of these, as well. We should keep that in mind as we now turn to exploring the variance of our random field as a function of distance, with the variogram.
+
+# Part 3: Variogram modeling and stationarity assumptions
+
+But before we begin to explore the covariance structure of our data, let's take a brief step back and think about our goal. We want a reasonable interpolation of our data at locations other than our observed points, and we want a measure of our uncertainty about those data points - how can we do this?
+
+Kriging is the answer, but recall from class how we've discussed three difference types of kriging models, each with different assumptions:
+
+* **Simple kriging**:
+* **Ordinary kriging**:
+* **Universal kriging**:
+
+What do you think is most appropriate here? What are some limitations?
+
+## De-trending our data
+
+For simple kriging, we'll need to specify a constant mean (this assumption of a known, constant mean is a strong one). For universal kriging, we'll need to model the mean function and learn its coefficients.
+
+Remember that we're less interested in directly modeling the spatial dependence of either the presence of observations or the value of the target variable at those locations, but rather *the spatial dependence of the residuals* after we've already tried to explain the trend non-spatially. So our first step before even getting into the variogram is to try to use the covariates for which have a hint of some predictive power to try to capture the target variable.
+
+**Here you have a few choices in modeling the trend with a linear model. Experiment with including or transforming some of the features, and choose a formula that you like to explain the mean trend. Some options for variables to experiment with here are `dist_to_hwy`, `temperature`, `humidity`, `altitude`, `pressure`, `deciviews`, and the categorical variable which we computed, called `name_class`.**
+
+If you like, you can run the following optional code to add the outlier point in Lynn as its own class in `name_class`. In that way it will be given a coefficient of its own by the mean function and its residual will no longer be an outlier. This is something of a hack, but it is possible:
+
+```{r}
+# same function as before but now modified for "Lobster" --> "outlier
+classify_names <- function(df){
+  df_new <- df %>% 
+    mutate(name_class = case_when(
+      grepl(pattern = "^DEP", x = name) ~ "DEP",
+      grepl(pattern = "FRRACS", x = name) ~ "FRRACS",
+      grepl(pattern = "Lobster", x = name) ~ "outlier",
+      TRUE ~ "OTHER"))
+  return(df_new)
+}
+
+bostonair_sf <- classify_names(bostonair_sf)
+bostonair_extended_sf <- classify_names(bostonair_extended_sf)
+```
+
+```{r}
+trend <- lm(data = bostonair_extended_sf,
+   formula = pm2.5_24hour ~ poly(dist_to_hwy, 2) + temperature + name_class)
+summary(trend)
+```
+
+This is a decent non-spatial model, but in order to make predictions we'd need to be able to plug in a value for each feature at whatever location we're interested in. Do you see why that might be a problem?
+
+## Mapping the de-trended data (residuals)
+
+Now let's map the residuals. First, since two observations were removed due to missingness in the linear model, let's find their indexes and then appropriately join the residual values to the dataframe (even if you specified your model differently, this should still work)
+
+```{r join-residuals}
+lm_NA_indices <- trend$residuals %>%
+  names %>%
+  as.numeric %>%
+  setdiff(1:nrow(bostonair_extended_sf), .)
+```
+
+```{r map-detrended}
+bostonair_extended_sf %>% 
+  slice(-lm_NA_indices) %>% 
+  mutate(resid = trend$residuals) %>% 
+  mapview(., zcol = "resid")
+```
+
+Perhaps some clustering of below-trend observations down in Needham, Mass as well as another outlier up in Lynn? Let's see the variogram!
+
+## Plotting an initial variogram
+
+Now we'll explore the covariance structure and isotropy assumptions with the variogram. First, we show the point cloud for each pair of observations (note that the x axis is measured in feet, so increments of 5280 correspond to one mile). As in the numerical examples, we can also take bin averages over certain widths to try to see the shape of the empirical variogram. There are a few heavy outliers in the sense that we have some high-variance observations which are a short distance apart:
+
+```{r variogram}
+variogram_cloud <- variogram(formula(trend),
+                             data = bostonair_extended_sf %>% 
+                               slice(-lm_NA_indices),
+                             cloud = TRUE)
+plot(variogram_cloud,
+     main = "Semivariance cloud for Boston air quality data")
+```
+
+Wait, aren't near things supposed to be more related than distant things? What's going on in the top-left of this plot? We still have high variance after modeling the mean, in fact the highest in the whole set of pairs of points, and yet these pairs are quite near each other.
+
+Outliers like this will occur in practice, and we shouldn't fear them. Instead, this is an indicator that there's something at work here which we don't know about. It could be a data quality issue (faulty sensor, incorrectly located coordinates, etc), but also likely is that there is some real-world explanation which we don't have information about. The name of this sensor is "Lobsterman's Landing", which appears to be an actual boat landing for lobster fishers (verify this by using mapview with the basemap `Esri.WorldImagery`). 
+
+```{r lobstermen}
+mapviewOptions(basemaps = c("Esri.WorldImagery"))
+bostonair_extended_sf %>% 
+  filter(name == "Lobsterman’s Landing") %>% 
+  mapview()
+```
+
+**What should we do with this?**
+
+Here are some potential arguments:
+
+* "Remove the data point entirely. There's no way that's correct!"
+* "Hang on, we just need to use the dummy variable in our model of the trend, which indicates whether or not an observation is on a lobsterman's landing of some kind"
+  + "How do you know that the effect is not about distance to the coast? Maybe we should calculate that distance for each point and then include that in the trend?"
+* "This is tedious. Let's just fit the variogram anyway - it's a real data point after all."
+
+**Where do you come down on the issue?**
+
+## Plotting binned variograms
+
+Whatever your inclination as to the treatment of the lobster fishing observation, we'll next want to plot a binned variogram in order to better sense where our fit might lie. We should simultaneously investigate whether we think our residuals exhibit isotropy (rotational invariance).
+
+```{r variograms-binned, fig.show="hold", out.width="50%"}
+par(mfrow = c(1, 2))
+# binned variogram using 5280ft (1 mile) as the width
+variogram_1mile <- variogram(formula(trend),
+                             data = bostonair_extended_sf %>% 
+                               slice(-lm_NA_indices), 
+                             width = 5280,
+                             cutoff = 5280 * 8,
+                             cloud = FALSE)
+# binned variogram using 5280*0.25ft (1/4 mile) as the width
+variogram_0.25mile <- variogram(formula(trend),
+                                data = bostonair_extended_sf %>% 
+                                  slice(-lm_NA_indices), 
+                                width = 5280 * 0.25,
+                                cutoff = 5280 * 8,
+                                cloud = FALSE)
+
+plot(variogram_1mile,
+     main = "Semivariance cloud for Boston air quality data\nbinned by 1-mile width")
+plot(variogram_0.25mile,
+     main = "Semivariance cloud for Boston air quality data\nbinned by 1/4-mile width")
+```
+
+## Testing for isotropy/anisotropy (rotational invariance/variance)
+
+Recall that isotropy is the property of being rotation invariant. If we chop up our field into radial segments and consider each separately, an isotropic random field would show similar variograms regardless of orientation. Since we have an ocean to the east, we'll just consider the west side - we divide our window into five regions of the westward semicircle that would be defined by the 12 and 6 on an analog clock:
+
+```{r isotropy}
+variogram_0.25mile_iso <- variogram(formula(trend),
+                                    data = bostonair_extended_sf %>% 
+                                      slice(-lm_NA_indices), 
+                                    width = 5280 * 0.25,
+                                    cutoff = 5280 * 8,
+                                    cloud = FALSE,
+                                    alpha = seq(360, 180, -180/5))
+plot(variogram_0.25mile_iso)
+```
+
+Since we have a few outliers, the scales are somewhat compressed for most points. However, even without those outliers, these plots do not seem to be showing evidence of isotropy. This confirms our hunch from the initial EDA that we would have anisotropy due to the presence of certain clusters with higher or lower mean values (remember the boxplot comparing the DEP and FRRACS sensors, as well as the unusually clean air of Needham, Mass).
+
+One way of dealing with these outliers is to use a robust measure of the empirical variogram, as referenced in Bivand 8.4 page 221. This robust estimator, developed by statistician Noel Cressie, chooses not to sum the squares of pairwise variations, but instead to sum the square roots of the pairwise variations and then exponentiate that scale to its fourth power. It can be implemented by supplying the logical value `cressie=TRUE` to the variogram call. Other robust measures exist as well.
+
+For our purposes, the simplest choice is to simply remove the outlying data points from the variogram modeling stage. However, we will retain the points when it comes to prediction. In this way we can preserve the effect of the outlying points locally.
+
+```{r variograms-binned-robust, fig.show="hold", out.width="50%"}
+par(mfrow = c(1, 2))
+
+bostonair_extended_filtered_sf <- bostonair_extended_sf %>% 
+  slice(-lm_NA_indices) %>%
+  filter(!(sensor_index %in% c(132267, 51347)))
+
+# redefine the cloud plot
+variogram_cloud2 <- variogram(formula(trend),
+                              data = bostonair_extended_filtered_sf,
+                              cutoff = 5280 * 8,
+                              cloud = TRUE)
+
+# binned variogram using 5280ft (1 mile) as the width
+variogram_1mile <- variogram(formula(trend),
+                             data = bostonair_extended_filtered_sf, 
+                             width = 5280,
+                             cutoff = 5280 * 8,
+                             cloud = FALSE)
+# binned variogram using 5280*0.25ft (1/4 mile) as the width
+variogram_0.25mile <- variogram(formula(trend),
+                                data = bostonair_extended_filtered_sf, 
+                                width = 5280 * 0.25,
+                                cutoff = 5280 * 8,
+                                cloud = FALSE)
+
+plot(variogram_1mile,
+     main = "Semivariance cloud for Boston air quality data\nbinned by 1-mile width. Robust estimation")
+plot(variogram_0.25mile,
+     main = "Semivariance cloud for Boston air quality data\nbinned by 1/4-mile width. Robust estimation")
+
+variogram_1mile_iso <- variogram(formula(trend),
+                                    data = bostonair_extended_filtered_sf, 
+                                    width = 5280,
+                                    cutoff = 5280 * 8,
+                                    cloud = FALSE,
+                                    alpha = seq(360, 180, -180/5))
+plot(variogram_1mile_iso)
+```
+
+After accounting for a trend in the mean as well as a couple influential outliers, the assumption of isotropy isn't entirely unreasonable. There are maybe still differences, but it's not drastic. This is a nice simplification of the problem - we could account for anisotropy with an exotic transformation of our kernel, but we won't need to do that here.
+
+## Fitting the variograms
+
+Now, let's try to fit a curve to these points. We have some options for how to model it, using either a spherical, Gaussian, exponential, or Matern kernel. We also have a nice function which helps up pick which kernel is optimal:
+
+```{r optimal-kernel}
+v_optimal <- fit.variogram(variogram_1mile,
+                           # spherical, Gaussian, exponential, Matern
+                           model = vgm(c("Sph", "Gau", "Exp","Mat")))
+v_optimal
+```
+
+```{r fit-variogram}
+v_Sph <- fit.variogram(variogram_0.25mile, model = vgm("Sph"))
+v_Sph_line <- variogramLine(v_Sph, maxdist = 40000) %>%
+  mutate(id = "line")
+
+# v_Gau <- fit.variogram(variogram_0.25mile, model = vgm("Gau"))
+# v_Gau_line <- variogramLine(v_Gau, maxdist = 40000) %>% 
+#   mutate(id = "line")
+
+# v_Exp <- fit.variogram(variogram_0.25mile, model = vgm("Exp"))
+# v_Exp_line <- variogramLine(v_Exp, maxdist = 40000) %>% 
+#   mutate(id = "line")
+
+# v_Mat <- fit.variogram(variogram_0.25mile, model = vgm("Mat"))
+# v_Mat_line <- variogramLine(v_Mat, maxdist = 40000) %>% 
+#   mutate(id = "line")
+
+
+# the base R version below isn't working for some reason, so a ggplot workaround
+# plot(variogram_0.25mile, main = "Variogram for spherical model at 0.25mi",
+#         type = "p")
+# lines(v_Sph_line, col = "red")
+
+variogram_0.25mile %>%
+  select(dist, gamma, id) %>%
+  bind_rows(v_Sph_line) %>%
+  ggplot(data = ., aes(x = dist, y = gamma, group = id, color = id)) +
+  geom_point() +
+  labs(title = "Variogram for spherical model at 0.25mi")
+
+# variogram_0.25mile %>% 
+#   select(dist, gamma, id) %>% 
+#   bind_rows(v_Gau_line) %>% 
+#   ggplot(data = ., aes(x = dist, y = gamma, group = id, color = id)) +
+#   geom_point() +
+#   labs(title = "Variogram for Gaussian model at 0.25mi")
+
+# variogram_0.25mile %>% 
+#   select(dist, gamma, id) %>% 
+#   bind_rows(v_Exp_line) %>% 
+#   ggplot(data = ., aes(x = dist, y = gamma, group = id, color = id)) +
+#   geom_point() +
+#   labs(title = "Variogram for exponential model at 0.25mi")
+# 
+# variogram_0.25mile %>% 
+#   select(dist, gamma, id) %>% 
+#   bind_rows(v_Mat_line) %>% 
+#   ggplot(data = ., aes(x = dist, y = gamma, group = id, color = id)) +
+#   geom_point() +
+#   labs(title = "Variogram for Matern model at 0.25mi")
+
+```
+
+
+## Additional commentary on the removal of outliers
+
+We've made a controversial choice to remove two outlying observations from the modeling process, and have examined a few of the arguments for and against the choice, as well as offered a principled alternative (Cressie's robust estimator). To give this discussion its due, we should compare the decision in this setting to how we might treat similar outliers in a more familiar regression setting, such as a non-spatial linear model.
+
+In OLS, removing outliers is strongly discouraged. While a particular outlier may violate one of the assumptions of the linear regression model, such as homoskedastic or normally distributed residuals, its presence does not hinder the use of a linear model. Instead, we would typically deal with outliers either through regularization or encoding a dummy variable to speecifically capture its variation (as we also employed here).
+
+The key difference in the spatial setting connects back to Tobler's First Law of Geography. If the variogram tells us that near things are not more related than distant things, does that mean that the law (and therefore our most foundational assumption in spatial statistics) is wrong? No.
+
+What this would indicate instead is that either our notion of distance or relatedness are mis-specified. We talked in class about the difference between straight-line distance between bodies of water on either side of a peninsula, and here we could have something similar such as doors, buildings, or other barriers. If this is the case, then our notion of distance is flawed. Alternatively, the relative scarcity of data compared to the size of our window and lack of confirmational observations means that we could be mis-interpreting the data which we do see. We know something is up, but we don't know what it is. In linear regression we might fit a model and move on, but here our foundational assumption doesn't hold with the current information. Removing observations from the model-fitting process is more justified here because the outliers are less in line with the assumptions of our model.
+
+# Part 4: Final modeling decisions and interpolation
+
+## Kriging
+
+At the beginning of Part 3 we talked about the different types of kriging, and what might be appropriate here. Simple kriging might make sense as a baseline model, but its strict assumptions of constant mean and variance do not hold here. Universal kriging, with its more flexible assumptions, is our best choice.
+
+### Creating the grid
+
+First we need to create a grid of points within our window over which to interpolate values. We can do this with some `sf` functions:
+
+```{r make-grid}
+boston_hull <- bostonair_extended_filtered_sf %>%
+  st_union() %>%
+  st_convex_hull()
+
+boston_grid <- boston_hull %>%
+  st_make_grid(cellsize = 5280 / 2, what = "centers") %>% 
+  st_intersection(boston_hull)
+
+roads <- st_read(dsn = "data/shp/roads.shp") %>% 
+  st_transform(crs = st_crs(bostonair_sf))
+
+dist_to_hwy_grid <- st_distance(roads, boston_grid)
+dist_to_hwy_grid <- apply(X = dist_to_hwy_grid, MARGIN = 2, FUN = min)
+
+boston_grid_dist <- as.data.frame(dist_to_hwy_grid) %>% 
+  mutate(geometry = boston_grid) %>% 
+  rename(dist_to_hwy = dist_to_hwy_grid) %>% 
+  st_as_sf() %>% 
+  st_set_crs(value = st_crs(boston_grid))
+
+mapview(boston_grid, cex = 3) # cex argument controls size, prevents overlap
+```
+
+### Simple kriging
+
+```{r simple-kriging}
+simple <- krige(formula = pm2.5_24hour ~ 1,
+                bostonair_extended_filtered_sf,
+                boston_grid,
+                model = v_optimal,
+                beta = mean(bostonair_extended_filtered_sf$pm2.5_24hour))
+class(simple)
+```
+
+```{r}
+mapviewOptions(basemaps = c("CartoDB.Positron", "Esri.WorldImagery"))
+leafsync::sync(mapview(simple, zcol = "var1.pred"),
+               mapview(simple, zcol = "var1.var"))
+```
+```{r}
+simple.cv <- krige.cv(pm2.5_24hour ~ 1, bostonair_extended_filtered_sf,
+                      model = v_optimal,
+                      beta = mean(bostonair_extended_filtered_sf$pm2.5_24hour),
+                      nfold = nrow(bostonair_extended_filtered_sf))
+leafsync::sync(mapview(simple.cv, zcol = "var1.pred"),
+               mapview(simple.cv, zcol = "var1.var"))
+```
+
+```{r}
+par(mfrow = c(1,2))
+hist(simple.cv$zscore)
+qqnorm(simple.cv$zscore)
+qqline(simple.cv$zscore)
+```
+
+### Universal kriging
+
+```{r universal-kriging}
+universal <- krige(bostonair_extended_filtered_sf,
+                   formula = as.formula(pm2.5_24hour ~ poly(dist_to_hwy, 2)),
+                   newdata = boston_grid_dist,
+                   model = v_optimal)
+```
+
+```{r}
+leafsync::sync(mapview(universal, zcol = "var1.pred", cex = 3),
+               mapview(universal, zcol = "var1.var", cex = 3))
+```
+
+Universal cross-validation:
+
+*As an exercise, repurpose the code for the cross-validation procedure above!*
+
+# Part 5: Final questions
+
+* Our result looks rather smooth. Why? Is it too smooth?
+* What are the main limitations of the model?
+* What are the main limitations of the data?
+* What modifications could be made to this analysis? (technical answers not required)
+* How should we treat areas that extend over water?
+
