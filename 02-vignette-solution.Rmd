@@ -1,0 +1,468 @@
+---
+title: 'Vignette #2 | STAT 141'
+author: "David Harshbarger"
+date: "March 2023"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+subtitle: Spatial linear models with R | Boston redlining case study
+urlcolor: blue
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(sfdep)
+library(spatialreg)
+library(mapview)
+library(kableExtra)
+```
+
+# Part 1: Background
+
+In this second vignette, we will be exploring real-world spatial data and an application of spatial statistics from a social science perspective. We will build toward fitting the Gaussian models we've studied to account for spatial autocorrelation (SAR, CAR, Lag SAR), and along the way will discuss modeling assumptions, contrast modeling decisions, and eventually compare potential models.
+
+Our research question(s) will differ slightly based on your suggestions, but this vignette will touch on **the geography of economic inequality and the legacy of discrimination, all within the Boston area.** Specifically, we will model home values as a function of several socioeconomic characteristics at the neighborhood level. *Note: We are purposefully not including physical characteristics of homes themselves - only neighborhood and individual characteristics will be used, aggregated at the neighborhood (Census Tract) level.* The one exception we consider is the median year in which homes were built for each neighborhood, which we include as an illustrative example of handling missing data.
+
+The file for this vignette combines data from two sources. The primary source is the US Census Bureau's American Community Survey (ACS) 2021 estimates, which accounts for all but one of our covariates. These data are open-source and can be accessed at [data.census.gov](data.census.gov). The other source is the University of Richmond's [Digital Scholarship Lab](https://dsl.richmond.edu/panorama/redlining/#loc=5/39.1/-94.58), which has compiled and geo-referenced scans (that is, painstakingly converted images into shapefiles) of historic redlining maps from dozens of mid-20th American cities.
+
+Redlining was a discriminatory process by which the United States government produced a number of maps of urban areas across the country, for use as lending guidelines for banks considering real estate investments. Beginning in 1935 and ending only in 1968 with the passing of the Fair Housing Act (a subsection of the famous Civil Rights Act of 1968), the process takes its name from the literal red lines drawn around neighborhoods deemed "most hazardous" or "undesirable", which were disproportionately minority neighborhoods.
+
+With this designation, prospective homeowners from **redlined neighborhoods were routinely turned down for loans** and unable to build equity. Decades of discriminatory lending have entrenched a racial gap in homeownership and wealth between white and non-white Americans, on average, which can be easily observed through open-source Census data, which we will be working with today.
+
+Importantly, redlining was not the beginning of housing discrimination in the United States - racially restrictive deeds were regularly employed without the direction of redlining maps, for instance - but because the maps are so plentiful and so well preserved it is one of the most *visible*, from a historical perspective. We will use an indicator in our spatial linear models to include the proportion of each neighborhood, by area, which was given this "most hazardous" designation. When controlling for other important covariates (as we will), redlining may be significant but not the driving predictor of home values. But the fact that a simple indicator from a nearly 100 year old map is related to so many salient socioeconomic characteristics of modern life speaks to the complicated, interconnected nature of urban geography.
+
+![Boston's redlining map. Source: University of Richmond.](images/holc-scan-boston2.jpeg)
+
+# Part 2: Setup
+
+```{r load-data}
+load("02-vignette.RData")
+```
+
+The `sf` dataframe which we will use to predict home values (`boston_fulldata_sf`) contains the following features, all measured at the geographic level of Census Tracts (our proxy for neighborhoods):
+
+* **GEOID**: A unique identifier of each Census Tract
+* **median_homeval**: Median value of homes *(our target variable)*
+* **median_hh_income**: Median income of households (including solo individuals)
+* **mean_hh_income**: Mean income of households (including solo individuals)
+* **percapita_income**: Per capita income
+* **pct_25plus_bachelors**: Share of residents age 25+ with a Bach. degree
+* **median_yearbuilt**: Median year homes were built
+* **gini_index**: Gini Index, a 0-1 index of income inequality *within* an area
+* **median_rent_inc_ratio**: Median rent-to-income ratio
+* **pop_total_2021**: Total population in 2021
+* **pct_black**: Share of population which are Black in 2021
+* **pct_lathisp**: Share of population which are Latino or Hispanic in 2021
+* **pct_white**: Share of population which are white in 2021
+* **pct_asian**: Share of population which are Asian in 2021
+* **pct_nonwhite**: Share of population which are not white in 2021
+* **homeownership_rate**: Share of adults who own their home
+* **homeownership_rate_black**: Share of Black adults who own their home
+* **pct_pubtransit**: Share of workers who take public transit to work
+* **avg_traveltime**: Average travel time of workers to their job
+* **D**: Percentage of neighborhood (by area) which overlaps with formerly redlined ("Grade D", or "hazardous" areas)
+* **C**: Percentage of neighborhood (by area) which overlaps with formerly "Grade C"
+* **B**: Percentage of neighborhood (by area) which overlaps with formerly "Grade B"
+* **A**: Percentage of neighborhood (by area) which overlaps with formerly "Grade A"
+* **geometry**: `sf` object column storing polygon spatial data for each tract
+
+We should briefly explore the features of `boston_fulldata_sf`, noting their scales and ranges, missing values, their spatial patterns (through mapping), and their relationships with the target variable (through plotting).
+
+```{r boston-summary}
+summary(boston_fulldata_sf)
+```
+
+```{r boston-NAs}
+# this command will loop over each column and compute the number of NAs
+apply(boston_fulldata_sf, 2, function(x){sum(is.na(x))})
+```
+
+We can see that most of our covariates have pretty good coverage, with only a few missing values. Census data are often nice in this way. However, those data which are missing could cause problems if we attempt to use them in spatial linear models, which we will later encounter. Now let's inspect the spatial layout of a few interesting variables with `mapview`.
+
+```{r map-median_homeval}
+# Map the target variable
+mapview(boston_fulldata_sf, zcol = "median_homeval")
+```
+
+The target variable has some clear spatial dependence. The distribution of median home values almost looks fairly continuous with neighboring areas often having similar values. We should also look at some of the covariates that we might be interested in using in our models. The following code maps median household income and can be easily modified to explore other covariates by supply the variable name to the `zcol` argument.
+
+```{r map-income}
+# Map an interesting covariate
+mapview(boston_fulldata_sf, zcol = "median_hh_income")
+```
+
+Let's also do some simple scatterplots of these relationships. First we define the helper function `plot_covariates_simply`, which can be easily modified below for any other combination of variables.
+
+```{r plot-income-v-homevalue}
+plot_covariates_simply <- function(var_x = median_hh_income,
+                                   var_y = median_homeval) {
+  ggplot(data = boston_fulldata_sf,
+         aes(x = {{var_x}}, y = {{var_y}})) +
+    geom_point(alpha = 0.5) +
+    geom_smooth(method = "loess", se = F)
+  }
+
+plot_covariates_simply(var_x = median_hh_income,
+                       var_y = median_homeval)
+```
+
+## The Plan
+
+From what is commonly known of neighborhood home values, we can reasonably suspect that there may be spatial autocorrelation between or a trend. We will fit baseline models, then test the residuals of those models for spatial dependence using the package `sfdep`. If spatial dependence is present, then we will make particular modeling decisions to represent the neighbor and weighting scheme, and then fit several spatial linear models (SAR, CAR, Lag SAR). Next, we will incorporate the covariate indicating redlining status, and then perform a likelihood ratio test to judge its usefulness. Finally, we will compare between different models based on AIC and log-likelihood.
+
+Along the way we will have to deal with two main roadblocks: missing data and unconnected polygons. We will handle and discuss these modeling decisions and others.
+
+# Part 3: Assessing spatial dependence
+
+We start by determining neighbor and weighting schemes as we have learned in class, using functions from `sfdep`:
+
+```{r contig-1}
+# Define contiguity
+boston_contig <- st_contiguity(boston_fulldata_sf)
+```
+
+```{r weighting-1, error=TRUE}
+# Define a binary weighting scheme (using style = "B")
+boston_weights.B <- st_weights(boston_contig, style = "B")
+```
+
+Why are we getting this error? Let's inspect the contiguity we defined:
+
+```{r}
+boston_contig
+```
+
+We can see from the printout that we have 1 region with no links. Since we've chosen a binary weighting scheme in which regions that touch are linked, it sounds like we have an island. Let's inspect visually. We'll plot the offending Census tract alone and then also plot all Census tracts overlaid, so that we can see what's going on. *(`mapview` tip: Zoom to the extent of the single tract by clicking its name in the bottom-righthand corner, then check and uncheck the overlaid layer to compare.)*
+
+```{r inspect-island}
+mapview(boston_fulldata_sf) + mapview(boston_fulldata_sf[396, ])
+```
+
+Surprisingly, it's not a real island! This is an artifact of our modeling decisions. This particular modeling decision was made for you in the data preprocessing step, in which I dropped Census tracts with no data for the target variable. While this wasn't an issue in most cases, in this one case we dropped tracts in such a way as to create an island.
+
+How would you deal with the "island"? Compare and contrast the following approaches:
+
+* Delete the island tract from your dataset and re-specify the contiguity
+* Keep the island tract but assign it as not being a neighbor of any other tract
+* Use a different weighting scheme besides binary, perhaps based off of distance rather than intersection
+* Impute values for the missing observations so that no dropping is necessary
+  + Impute with sample mean (underestimating potential spatial dependence)
+  + Impute with weighted average of neighbors (*inducing* spatial dependence)
+  + Any other interpolation method
+
+Would your answers change if the island were very highly populated? What about if there were many more islands?
+
+## You Choose
+
+Here's your first modeling choice of your own. Pick a method for dealing with this missing data problem and define a contiguity and weighting scheme. Remember what you've chosen as we'll do a class-wide analysis at the end! Run option 1 at least (we'll need it to compare in a minute), and then **select your favorite choice of weighting scheme.**
+
+```{r weighting-choices, warning=FALSE}
+# 1) Delete the island tract from your dataset and re-specify the contiguity
+boston_fulldata_sf <- boston_fulldata_sf %>% 
+  filter(GEOID != "25025010408") # leave this uncommented, even if you choose another option
+boston_contig <- st_contiguity(boston_fulldata_sf) # this too
+
+# now choose:
+boston_weights <- st_weights(boston_contig, style = "B")
+boston_weights <- st_weights(boston_contig, style = "W")
+boston_weights <- st_weights(boston_contig, style = "C")
+boston_weights <- st_weights(boston_contig, style = "U")
+boston_weights <- st_weights(boston_contig, style = "S")
+
+# 2) Use a different weighting scheme besides binary, perhaps based off of distance rather than intersection
+# Here we use an inverse-distance weighting scheme, which doesn't mind islands
+
+boston_dist.range <- st_dist_band(st_centroid(boston_fulldata_sf),
+                                  lower = 0, # specify lower bound of range (m)
+                                  upper = 2e4) # specify upper bound of range (m)
+boston_weights <- st_inverse_distance(nb = boston_dist.range,
+                                      geometry = st_centroid(boston_fulldata_sf),
+                                      scale = 10^3) # rescale units to km
+
+# 3) Keep the island tract but assign it as not being a neighbor of any other tract.
+# Not implemented, but one could use the `allow_zero = TRUE` argument.
+
+# 4) Impute values for the missing observations so that no dropping is necessary
+# Not implemented. Dropping them was done as a preprocessing step, so undoing it is left as a thought experiment.
+```
+
+```{r weight-hidden, include=FALSE}
+# This is specified but hidden, just so that the code will run.
+boston_weights <- st_weights(boston_contig, style = "W")
+```
+
+Now that we've dealt with the contiguity issue, we can perform our first **Moran's I test**. *(We can see that our modeling choices are starting to propagate through the analysis - it's a good idea to think carefully early on about how the impact of your choices will scale!)*
+
+```{r moran-1}
+global_moran_test(boston_fulldata_sf$median_homeval,
+                  nb = boston_contig,
+                  wt = boston_weights)
+```
+
+The preliminary Moran's I test confirms what we already knew: there is strong evidence of *some spatial trend or correlation* in median home values of neighborhoods. Another way to confirm this would be with a spatial lag plot:
+
+```{r spatial-lag-plot-1}
+boston_fulldata_sf %>% 
+  mutate(lag = st_lag(median_homeval,
+                      nb = boston_contig,
+                      wt = boston_weights)) %>% 
+  ggplot(data = .,
+         aes(x = median_hh_income,
+             y = lag)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = F) +
+  labs(x = "Median household income",
+       y = "Spatial Lag",
+       title = "Spatial lag, median home value\nvs. median household income")
+```
+
+The shape of the trend in the spatial lag plot can look fairly different depending on choice of weighting.
+
+# Part 4: Baseline modeling with OLS, ignoring spatial structure at first
+
+Now it's time to start putting together some linear models. Remember the plan: start with non-spatial models, then test for spatial dependence of residuals. You'll have some flexibility here too!
+
+First, we set up some very basic baseline models:
+
+```{r lm}
+# raw baseline, mean of target variable
+lm0 <- lm(data = boston_fulldata_sf,
+          formula = median_homeval ~ 1) # if no predictors, we just get the mean
+summary(lm0)
+
+# naive baseline, predicting log of the target variable with log-mean income
+# Note: While we use log-mean income here because it is nicer mathematically,
+# median income is more interpretable and might be worth using if you need
+# to communicate results. Often results will agree more or less
+lm1 <- lm(data = boston_fulldata_sf,
+          formula = log(median_homeval) ~ log(mean_hh_income))
+summary(lm1)
+
+
+```
+
+Then, more full models, both with and without the redlining covariate, called `D`:
+
+```{r}
+lm2 <- lm(data = boston_fulldata_sf,
+          formula = log(median_homeval) ~ log(mean_hh_income) + pct_25plus_bachelors +
+            pct_nonwhite + avg_traveltime + homeownership_rate)
+summary(lm2)
+
+lm3 <- lm(data = boston_fulldata_sf,
+          formula = log(median_homeval) ~ log(mean_hh_income) + pct_25plus_bachelors +
+            pct_nonwhite + avg_traveltime + homeownership_rate + D)
+summary(lm3)
+```
+
+## You Choose
+
+Now define your own linear model based on predictors that you think might be interesting. If you need a reminder, try `names(boston_fulldata_sf)` or `summary(boston_fulldata_sf)`. **However, don't include the variable `D` just yet.** We'll do that last.
+
+As a bonus, you may even be interested to do some feature engineering here. It may be the case that whether or not a neighborhood is a suburb is a fact that is predictive of home value (at least, it's plausible). In absence of a variable measuring this directly, one could compute it fairly simply and add it to the design matrix and specify the new feature in your models. (Although, this does raise even more questions and require more modeling decisions - is this a binary variable defined at a threshold? Or is it a continuous variable to be squared in the formula perhaps?)
+
+```{r optional-new-feature-1}
+### OPTIONAL
+# Location of the center of downtown, given as an sf point
+downtown_location <- data.frame(lon = c(-71.05766), lat = c(42.35987)) %>% 
+  st_as_sf(coords = c(x = "lon", y = "lat")) %>% 
+  st_set_crs(value = st_crs(boston_fulldata_sf))
+
+# If you were to attempt this, you might try st_centroid() followed by st_distance()
+# you could save that result as a vector, and then append it to boston_fulldata_sf
+
+# distance_from_downtown <- ...
+# boston_fulldata_sf$dist <- distance_from_downtown
+### OPTIONAL
+```
+
+Additionally, you may be interested in using the "median year home were built" variable, but might have noticed that it is missing many observations. How should we proceed? As in the first missing data problem, we have a number of options, although this time to simply subset for neighborhoods where data exist would halve our sample size and likely obscure any potential spatial structure. We could try the following naive imputation, replacing missing values, with the sample mean for that covariate, ignoring the influence of neighbors and thereby yielding the same results regardless of spatial layout. Is there another way?
+
+```{r optional-new-feature-2}
+boston_fulldata_sf <- boston_fulldata_sf %>% 
+  mutate(median_yearbuilt = replace_na(median_yearbuilt,
+                                       mean(median_yearbuilt, na.rm = TRUE)))
+```
+
+Back to the main thing, specifying a formula to be used in the non-spatial and spatial models:
+
+```{r formula-hidden, include=FALSE}
+# This is specified but hidden, just so that the code will run.
+# Students are expected to fill in the next chunk
+myformula <- as.formula(log(median_homeval) ~ log(mean_hh_income) + pct_25plus_bachelors +
+            pct_nonwhite + avg_traveltime + homeownership_rate)
+```
+
+```{r formula, error = TRUE}
+# Formula example
+formula_ex <- as.formula(log(median_homeval) ~ sqrt(mean_hh_income) + log(pop_total_2021))
+# Your formula
+myformula <- as.formula(___)
+```
+
+Fit a non-spatial linear model with your specified formula:
+
+```{r}
+lm_myformula <- lm(data = boston_fulldata_sf,
+                   formula = myformula)
+summary(lm_myformula)
+
+lm_plus_redlining <- lm(data = boston_fulldata_sf,
+                        formula = update(myformula, ~ . + D)) # add redlining, "D"
+summary(lm_plus_redlining)
+
+(LRT_lm <- anova(lm_myformula, lm_plus_redlining, test = "LRT"))
+```
+
+Now that we've fit several models, we can check their residuals for spatial dependence:
+
+```{r moran-2}
+global_moran_test(residuals(lm1),
+                  nb = boston_contig,
+                  wt = boston_weights, alternative = "two.sided")
+```
+
+```{r spatial-lag-plot-2}
+cbind(residuals(lm2),
+      st_lag(residuals(lm2), nb = boston_contig, wt = boston_weights)) %>% 
+  as.data.frame() %>% 
+  ggplot(data = ., aes(x = V1, y = V2)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = F) +
+  labs(x = "Residuals",
+       y = "Spatial Lag",
+       title = "Spatial lag plot of residuals of lm")
+```
+
+At this stage, is this code able to perform an Moran's I test or create a spatial lag plot or not? The answer will depend on your choices of weighting and linear model. If it's not working, what error are you getting, and why do you think that is?
+
+```{r qq}
+qqnorm(residuals(lm3))
+qqline(residuals(lm3))
+```
+
+Based on the Moran's I, the spatial lag plot of residuals, and perhaps the QQ plot, what can be said about the residuals of these non-spatial models?
+
+# Part 5: Spatial models
+
+Assuming that your linear models did not fully explain the spatial structure of the residuals, we could probably benefit from modeling spatial dependence directly. We will use the formula(s) we've specified above to fit analogous SAR, CAR, and Lag SAR models based on your chosen formula. Then, we will add the redlining covariate to obtain an additional model for each. Finally, we will compare results of all models with AIC and log-likelihood.
+
+```{r SAR}
+sar_myformula <- spautolm(data = boston_fulldata_sf,
+                 formula = myformula, # match your chosen formula
+                 family = "SAR",
+                 listw = recreate_listw(nb = boston_contig,
+                                        wt = boston_weights))
+summary(sar_myformula)
+
+sar_plus_redlining <- spautolm(data = boston_fulldata_sf,
+                               formula = update(myformula, ~ . + D), # add redlining, "D"
+                               family = "SAR",
+                               listw = recreate_listw(nb = boston_contig,
+                                                      wt = boston_weights))
+summary(sar_plus_redlining)
+```
+
+How do the two models compare? Additionally, we can perform a likelihood ratio test:
+
+```{r LRT-SAR}
+(LRT_SAR <- LR.Sarlm(sar_myformula, sar_plus_redlining))
+```
+
+From the likelihood ratio test above, does adding the redlining covariate improve the model significantly? We next repeat the process for CAR and Lag SAR models as well.
+
+```{r CAR}
+car_myformula <- spautolm(data = boston_fulldata_sf,
+                 formula = myformula, # match your chosen formula
+                 family = "CAR",
+                 listw = recreate_listw(nb = boston_contig,
+                                        wt = boston_weights))
+summary(car_myformula)
+
+car_plus_redlining <- spautolm(data = boston_fulldata_sf,
+                               formula = update(myformula, ~ . + D), # add redlining, "D"
+                               family = "CAR",
+                               listw = recreate_listw(nb = boston_contig,
+                                                      wt = boston_weights))
+summary(car_plus_redlining)
+
+(LRT_CAR <- LR.Sarlm(car_myformula, car_plus_redlining))
+```
+
+```{r Lag-SAR}
+lagsar_myformula <- lagsarlm(data = boston_fulldata_sf,
+                             formula = myformula, # match your chosen formula
+                             listw = recreate_listw(nb = boston_contig,
+                                                    wt = boston_weights))
+
+summary(lagsar_myformula)
+
+lagsar_plus_redlining <- lagsarlm(data = boston_fulldata_sf,
+                                  formula = update(myformula, ~ . + D), # add redlining, "D"
+                                  listw = recreate_listw(nb = boston_contig,
+                                                         wt = boston_weights))
+
+summary(lagsar_plus_redlining)
+
+(LRT_LagSAR <- LR.Sarlm(lagsar_myformula, lagsar_plus_redlining))
+```
+
+How have things turned out? Let's report all our metrics together:
+
+```{r results-table, include=FALSE}
+results_table <- data.frame(
+             Model = c("OLS", "OLS+D",
+                       "SAR", "SAR+D",
+                       "CAR", "CAR+D",
+                       "Lag SAR", "Lag SAR+D"),
+             aic = c(AIC(lm_myformula),
+                     AIC(lm_plus_redlining),
+                     AIC(sar_myformula),
+                     AIC(sar_plus_redlining),
+                     AIC(car_myformula),
+                     AIC(car_plus_redlining),
+                     AIC(lagsar_myformula),
+                     AIC(lagsar_plus_redlining)),
+             loglik = c(logLik(lm_myformula),
+                        logLik(lm_plus_redlining),
+                        logLik(sar_myformula),
+                        logLik(sar_plus_redlining),
+                        logLik(car_myformula),
+                        logLik(car_plus_redlining),
+                        logLik(lagsar_myformula),
+                        logLik(lagsar_plus_redlining))
+                 )
+```
+
+```{r results-kable, echo=FALSE}
+results_table %>% 
+  kbl() %>%
+  kable_classic()
+```
+
+# Part 6: Limitations of modeling choices
+
+If you've been able to tinker with the specifications of these models, then you may have results that are significantly different from your classmates. Is that surprising or expected? Did you get any particularly unusual results?
+
+We've made a lot of design choices in this process, and while each have been justified, the many other similarly justified choices could have led us somewhere else. Let's talk about those choices, and the limitations of these models.
+
+Modeling decisions and limitations:
+
+* **Spatial and temporal scope**: We are only examining a few hundred neighborhoods in Boston with 2021 data. What would we find if we zoomed out in space and/or time?
+* **Target variable**: Why are we studying median home price? Why not predict income? What would change if we did?
+* **Geographic unit**: We use Census tracts as a proxy for neighborhoods. This is common in urban geography and about as good a proxy for which we expect to have good quality data.
+* **Feature engineering**:
+  + In creating the redlining variable during preprocessing, I considered overlap by land area, but what we really care about are homes. This would only be a valid assumption if homes are regularly and uniformly distributed within tracts, which of course they aren't. One fix here would be to compute population-weighted centroids of tracts and scale the overlap by distance from the centroid.
+  + If you computed the "distance from downtown" variable, you had to come up with a way to do that and determine how to include it in your model. Did you remember to project your data before geocomputation? Would the distortion really matter at this scale? (Maybe, it's borderline)
+  + If you chose to include the "median year homes were built" variable, you imputed missing values in a way which underestimated the true spatial autocorrelation that likely exists. What are other ways that could be done?
+* **Study window**: Which Census tracts get included? How far out into the suburbs do we go? The choice made in preprocessing was to basically limit it to the extent of the map shown in Figure 1 in the introduction, more or less.
+* **Variable selection**: Variable selection is obviously an important modeling decision, but more than that, we specifically chose not to consider certain variables specific to the homes themselves, instead limiting ourselves to what we can determine from socioeconomic characteristics alone.
+
+
+**What other modeling decisions did we make, that you recall? How much uncertainty do you think they introduce?**
+
+# Part 7: Final thoughts
+
+It is very likely that we still have omitted variables, and we would probably be wise to keep omitted variable bias in mind when interpreting any of the results of these models just yet. That said, we know a few things. First, we know that outcomes at the neighborhood level are spatially linked and autocorrelation seems non-trivial to remove. Cities are complicated! Second, we know that formerly redlined neighborhoods are associated with slightly lower economic outcomes than other neighborhoods, and we know some of the historical context for why that is likely the case. It is striking that nearly 100 years can pass without changing the fortunes of some neighborhoods. However, it also does not appear that the maps are a quick fix to being able to quantify and locate discrimination - if they were, then we would expect them to be more predictive of home prices or other covariates of interest. As is often the case, the truth is more complicated and progress is not simple!
